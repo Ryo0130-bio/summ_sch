@@ -24,6 +24,11 @@ DEFAULT = dict(
     eta=0.05,     # 学習の1回の移動量 (単体上)
     measure='degree',  # 学習で使う中心性: degree / pagerank / eigenvector
     beta=0.3,     # 比較基準(過去の成績)の指数移動平均の重み。1 なら「直前の窓」とだけ比較
+    # ---- 学習の方式 ----
+    learning='hill',   # hill: 自分の試行錯誤 (モデル2) / imitation: 隣人の模倣 (モデル3)
+    imit_K=0.5,        # フェルミ則の温度 (次数の単位)。小さいほど成績の差に敏感
+    mut_rate=0.1,      # 評価のたびに配分が突然変異する確率
+    mut_sigma=0.15,    # 突然変異の大きさ (単体上の移動量の標準偏差)
 )
 
 def power(S, p):
@@ -144,6 +149,35 @@ class Sim:
         newx = self.x[L] + self.p['eta'] * self.dir[L]
         self.x[L] = np.apply_along_axis(project_simplex, 1, newx)
 
+    # ---------- 模倣学習 (フェルミ則 + 突然変異) ----------
+    def imitate_step(self, pay):
+        """各学習者が隣人を1人ランダムに選び、確率 1/(1+exp(-(P_j-P_i)/K)) でその配分をまねる。
+        全員が同時に、更新前の配分を見て判断する。その後、確率 mut_rate で配分を少しずらす。"""
+        p, rng, N = self.p, self.rng, self.p['N']
+        old = self.x.copy()
+        scale = N - 1                                 # pay は次数/(N-1) なので次数の単位に戻す
+        for i in np.flatnonzero(self.learn):
+            nb = self.adj[i]
+            if not nb:
+                continue
+            j = rng.choice(list(nb))
+            dP = (pay[j] - pay[i]) * scale
+            if rng.random() < 1 / (1 + np.exp(-dP / p['imit_K'])):
+                self.x[i] = old[j]
+                self._on_copy(i, j)
+        mut = self.learn & (rng.random(N) < p['mut_rate'])
+        if mut.any():
+            d = self._rand_dir(mut.sum()) * np.abs(rng.normal(0, p['mut_sigma'], (mut.sum(), 1)))
+            self.x[mut] = np.apply_along_axis(project_simplex, 1, self.x[mut] + d)
+            self._on_mutate(np.flatnonzero(mut))
+
+    # 解析用のフック (戦略の系譜を記録したいサブクラスが上書きする)
+    def _on_copy(self, i, j):
+        pass
+
+    def _on_mutate(self, idx):
+        pass
+
     def run(self, record_every=None):
         p = self.p
         hist = []
@@ -153,7 +187,10 @@ class Sim:
                 self.win += self.centrality('degree')
             if self.learn.any() and (t + 1) % p['tau'] == 0:
                 pay = self.win / p['tau'] if p['measure'] == 'degree' else self.centrality(p['measure'])
-                self.learn_step(pay)
+                if p.get('learning', 'hill') == 'imitation':
+                    self.imitate_step(pay)
+                else:
+                    self.learn_step(pay)
                 self.win[:] = 0
             if record_every and t % record_every == 0:
                 hist.append(self.x.copy())
@@ -185,7 +222,8 @@ def model2(p, seed, x0=(1/3, 1/3, 1/3)):
     return np.array([h[0] for h in hist]), sim
 
 def model3(p, seed, x0=(1/3, 1/3, 1/3)):
-    """全員が同じ初期配分から学習"""
+    """全員が同じ初期配分から、隣人の模倣で学習する"""
+    p = dict(p, learning='imitation')
     rng = np.random.default_rng(seed)
     alloc = np.tile(x0, (p['N'], 1))
     sim = Sim(alloc, np.ones(p['N'], bool), p, rng)
